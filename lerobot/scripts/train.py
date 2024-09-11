@@ -188,6 +188,9 @@ def log_train_info(logger: Logger, info, step, cfg, dataset, is_online):
         # in seconds
         f"updt_s:{update_s:.3f}",
         f"data_s:{dataloading_s:.3f}",  # if not ~0, you are bottlenecked by cpu or io
+
+        f"agg_updt_s:{info['agg_update_s']:.3f}",
+        f"agg_data_s:{info['agg_dataloading_s']:.3f}",
     ]
     logging.info(" ".join(log_items))
 
@@ -310,7 +313,9 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     torch.backends.cuda.matmul.allow_tf32 = True
 
     logging.info("make_dataset")
-    offline_dataset = make_dataset(cfg)
+    n_train_samples = 20059
+    offline_dataset = make_dataset(cfg, split=f"train[:{n_train_samples}]")
+    validation_dataset = make_dataset(cfg, split=f"train[{n_train_samples}:]")
     if isinstance(offline_dataset, MultiLeRobotDataset):
         logging.info(
             "Multiple datasets were provided. Applied the following index mapping to the provided datasets: "
@@ -351,6 +356,8 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     logging.info(f"{cfg.training.online_steps=}")
     logging.info(f"{offline_dataset.num_samples=} ({format_big_number(offline_dataset.num_samples)})")
     logging.info(f"{offline_dataset.num_episodes=}")
+    logging.info(f"{validation_dataset.num_samples=} ({format_big_number(validation_dataset.num_samples)})")
+    logging.info(f"{validation_dataset.num_episodes=}")
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
@@ -400,9 +407,22 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
             drop_n_last_frames=cfg.training.drop_n_last_frames,
             shuffle=True,
         )
+        dump_train_sampler = EpisodeAwareSampler(
+            offline_dataset.episode_data_index,
+            drop_n_last_frames=cfg.training.drop_n_last_frames,
+            shuffle=False,
+        )
+        dump_val_sampler = EpisodeAwareSampler(
+            validation_dataset.episode_data_index,
+            drop_n_last_frames=cfg.training.drop_n_last_frames,
+            shuffle=False,
+        )
     else:
         shuffle = True
         sampler = None
+        dump_train_sampler = None
+        dump_val_sampler = None
+
     dataloader = torch.utils.data.DataLoader(
         offline_dataset,
         num_workers=cfg.training.num_workers,
@@ -414,8 +434,32 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
     )
     dl_iter = cycle(dataloader)
 
+    dump_train_dataloader = torch.utils.data.DataLoader(
+        offline_dataset,
+        num_workers=cfg.training.num_workers,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        sampler=dump_train_sampler,
+        pin_memory=device.type != "cpu",
+        drop_last=False,
+    )
+    dump_val_dataloader = torch.utils.data.DataLoader(
+        validation_dataset,
+        num_workers=cfg.training.num_workers,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        sampler=dump_val_sampler,
+        pin_memory=device.type != "cpu",
+        drop_last=False,
+    )
+
     policy.train()
     offline_step = 0
+    run_id = int(time.time()*10000)
+    print("run_id", run_id)
+
+    times = {"agg_dataloading_s": [], "agg_update_s": []}
+
     for _ in range(step, cfg.training.offline_steps):
         if offline_step == 0:
             logging.info("Start offline training on a fixed dataset")
@@ -438,8 +482,53 @@ def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = No
         )
 
         train_info["dataloading_s"] = dataloading_s
+        times["agg_dataloading_s"].append(train_info["dataloading_s"])
+        times["agg_update_s"].append(train_info["update_s"])
+
+        for k in train_info.keys():
+            if "per_sample" in k:
+                train_info[k] = train_info[k].mean().item()
+
+        if step > 0 and step % 4000 == 0:
+            # Save the losses
+            def get_losses(policy, loader):
+                device = get_device_from_parameters(policy)
+                policy.eval()
+                data = dict()
+                def _update(d, k, v):
+                    if k not in d:
+                        d[k] = []
+                    d[k].append(v)
+
+                with torch.no_grad():
+                    for batch in loader:
+                        for key in batch:
+                            batch[key] = batch[key].to(device, non_blocking=True)
+
+                        with torch.autocast(device_type=device.type) if cfg.use_amp else nullcontext():
+                            output_dict = policy.forward(batch)
+                            for k in ['observation.state', 'action', 'episode_index', 'frame_index', 'observation.state_is_pad', 'action_is_pad']:
+                                _update(data, k, batch[k].cpu().numpy())
+                            for k in ['per_sample_loss']:
+                                _update(data, k, output_dict[k])
+
+                    for k in data.keys():
+                        data[k] = np.concatenate(data[k], axis=0)
+
+                policy.train()
+                return data
+
+            train_losses = get_losses(policy, dump_train_dataloader)
+            val_losses = get_losses(policy, dump_val_dataloader)
+
+            with open(f"data/losses_{run_id}_step_{step}.pkl", "wb") as f:
+                import pickle
+                pickle.dump({"train": train_losses, "val": val_losses}, f)
 
         if step % cfg.training.log_freq == 0:
+            for k in times:
+                train_info[k] = np.mean(times[k])
+                times[k] = []
             log_train_info(logger, train_info, step, cfg, offline_dataset, is_online=False)
 
         # Note: evaluate_and_checkpoint_if_needed happens **after** the `step`th training update has completed,

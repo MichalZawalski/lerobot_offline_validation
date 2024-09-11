@@ -141,14 +141,18 @@ class VQBeTPolicy(
             loss, n_different_codes, n_different_combinations, recon_l1_error = (
                 self.vqbet.action_head.discretize(self.config.n_vqvae_training_steps, batch["action"])
             )
+            with torch.no_grad():
+                per_sample_loss = torch.full((batch["action"].size(0),), loss.item(), device=loss.device)
             return {
                 "loss": loss,
                 "n_different_codes": n_different_codes,
                 "n_different_combinations": n_different_combinations,
                 "recon_l1_error": recon_l1_error,
+                "per_sample_loss": per_sample_loss
             }
         # if Residual VQ is already trained, VQ-BeT trains its GPT and bin prediction head / offset prediction head parts.
         _, loss_dict = self.vqbet(batch, rollout=False)
+        loss_dict['per_sample_loss'] = loss_dict['action_mse_error_per_sample']
 
         return loss_dict
 
@@ -602,6 +606,7 @@ class VQBeTHead(nn.Module):
         equal_primary_code_rate = torch.sum((action_bins[:, 0] == sampled_centers[:, 0]).int()) / (NT)
         equal_secondary_code_rate = torch.sum((action_bins[:, 1] == sampled_centers[:, 1]).int()) / (NT)
 
+        action_mse_error_per_sample = torch.mean((action_seq - predicted_action) ** 2, dim=(1, 2))
         action_mse_error = torch.mean((action_seq - predicted_action) ** 2)
         vq_action_error = torch.mean(torch.abs(action_seq - decoded_action))
         offset_action_error = torch.mean(torch.abs(action_seq - predicted_action))
@@ -619,6 +624,7 @@ class VQBeTHead(nn.Module):
             "offset_action_error": offset_action_error.detach().cpu().item(),
             "action_error_max": action_error_max.detach().cpu().item(),
             "action_mse_error": action_mse_error.detach().cpu().item(),
+            "action_mse_error_per_sample": action_mse_error_per_sample.detach().cpu().numpy(),
         }
         return loss_dict
 

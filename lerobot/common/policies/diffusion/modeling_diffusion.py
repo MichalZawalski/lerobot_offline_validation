@@ -153,8 +153,10 @@ class DiffusionPolicy(
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
         batch = self.normalize_targets(batch)
-        loss = self.diffusion.compute_loss(batch)
-        return {"loss": loss}
+        losses = self.diffusion.compute_loss(batch)
+        return {"loss": losses.mean(), "per_sample_loss": losses.detach().cpu().numpy()}
+        # loss = self.diffusion.compute_loss(batch)
+        # return {"loss": loss}
 
 
 def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
@@ -347,7 +349,8 @@ class DiffusionModel(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
-        return loss.mean()
+        # return loss.mean()
+        return loss
 
 
 class SpatialSoftmax(nn.Module):
